@@ -166,9 +166,12 @@ jobs:
       - name: Commit manifest to trigger website deployment
         shell: pwsh
         working-directory: site
+        env:
+          SINSDEX_PUBLISH_EMAIL: ${{ secrets.SINSDEX_PUBLISH_EMAIL }}
         run: |
+          if (-not $env:SINSDEX_PUBLISH_EMAIL) { throw 'Verified deployment author identity is not configured.' }
           git config user.name 'Sinsdex release automation'
-          git config user.email 'tubrocafi@gmail.com'
+          git config user.email $env:SINSDEX_PUBLISH_EMAIL
           git add releases/stable.json
           git commit -m "Publish signed Sinsdex IDE $env:SINSDEX_VERSION"
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
