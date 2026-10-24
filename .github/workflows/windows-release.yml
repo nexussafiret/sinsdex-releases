@@ -82,13 +82,11 @@ jobs:
     needs: validate
     if: vars.WINDOWS_SIGNING_READY == 'true'
     runs-on: windows-latest
-    env:
-      GH_TOKEN: ${{ github.token }}
-      CSC_LINK_B64: ${{ secrets.CSC_LINK_B64 }}
-      CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
     steps:
       - name: Enforce signing prerequisite
         shell: pwsh
+        env:
+          CSC_LINK_B64: ${{ secrets.CSC_LINK_B64 }}
         run: |
           if (-not $env:CSC_LINK_B64) { throw 'Signing was enabled without CSC_LINK_B64. Stable publication is blocked.' }
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -111,6 +109,8 @@ jobs:
           node tools/bootstrap-runtime.cjs
       - name: Choose next immutable release version
         working-directory: source/desktop
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: node tools/next-version.cjs
       - name: Repack changed source before signing
         working-directory: source/desktop
@@ -120,6 +120,8 @@ jobs:
           python tools/verify-package.py
       - name: Configure certificate and Windows SDK signing tool
         shell: pwsh
+        env:
+          CSC_LINK_B64: ${{ secrets.CSC_LINK_B64 }}
         run: |
           $certificateFile = Join-Path $env:RUNNER_TEMP 'sinsdex-signing.pfx'
           [IO.File]::WriteAllBytes($certificateFile, [Convert]::FromBase64String($env:CSC_LINK_B64))
@@ -130,6 +132,8 @@ jobs:
           "SINSDEX_SIGNTOOL=$($signTool.FullName)" >> $env:GITHUB_ENV
       - name: Build signed per-user NSIS installer
         working-directory: source/desktop
+        env:
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
         run: npm run dist:win
       - name: Verify final installer Authenticode publisher
         shell: pwsh
@@ -138,6 +142,8 @@ jobs:
       - name: Publish immutable signed release assets
         shell: pwsh
         working-directory: source/desktop
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           $installer = "release/Sinsdex-IDE-Setup-$env:SINSDEX_VERSION-x64.exe"
           $notes = Join-Path $env:RUNNER_TEMP 'release-notes.md'
@@ -172,3 +178,9 @@ jobs:
             if ($LASTEXITCODE) { throw 'Manifest rebase requires review.' }
           }
           "Signed release published; website manifest updated for $env:SINSDEX_VERSION." >> $env:GITHUB_STEP_SUMMARY
+      - name: Remove temporary signing certificate
+        if: always()
+        shell: pwsh
+        run: |
+          $certificateFile = Join-Path $env:RUNNER_TEMP 'sinsdex-signing.pfx'
+          if (Test-Path -LiteralPath $certificateFile) { Remove-Item -LiteralPath $certificateFile -Force }
