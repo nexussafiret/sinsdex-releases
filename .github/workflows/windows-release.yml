@@ -1,0 +1,174 @@
+name: Signed Windows release
+on:
+  push:
+    tags: ['desktop-*']
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact private website repository commit containing desktop snapshot
+        required: true
+        type: string
+permissions:
+  contents: write
+concurrency:
+  group: signed-windows-release
+  cancel-in-progress: false
+jobs:
+  validate:
+    runs-on: windows-latest
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - name: Validate source reference
+        id: source
+        shell: pwsh
+        env:
+          INPUT_SHA: ${{ inputs.source_sha }}
+          EVENT_REF: ${{ github.ref_name }}
+        run: |
+          $sourceSha = $env:INPUT_SHA
+          if (-not $sourceSha -and $env:EVENT_REF -match '^desktop-([0-9a-f]{40})$') { $sourceSha = $Matches[1] }
+          if ($sourceSha -notmatch '^[0-9a-f]{40}$') { throw 'An exact source commit SHA is required.' }
+          "sha=$sourceSha" >> $env:GITHUB_OUTPUT
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: nexussafiret/sinsdexide-website
+          ref: ${{ steps.source.outputs.sha }}
+          path: source
+          ssh-key: ${{ secrets.SINSDEX_SOURCE_SSH_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: source/desktop/package-lock.json
+      - name: Verify exact desktop sources
+        run: node source/desktop/tools/verify-snapshot.cjs
+      - name: Install build tools
+        working-directory: source/desktop
+        run: npm ci
+      - name: Bootstrap runtime from immutable verified seed
+        working-directory: source/desktop
+        run: node tools/bootstrap-runtime.cjs
+      - name: Verify settings, local account boundaries and updater controls
+        working-directory: source/desktop
+        run: |
+          node tools/verify-settings-store.cjs
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          node tools/verify-local-policy.cjs
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          node tools/verify-updates.cjs
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          node --check app/main.js
+      - name: Repack and verify Electron integrity
+        working-directory: source/desktop
+        run: |
+          python tools/repack.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python tools/verify-package.py
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: desktop-verification-${{ steps.source.outputs.sha }}
+          path: source/desktop/*verification.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Report signing gate
+        if: vars.WINDOWS_SIGNING_READY != 'true'
+        run: |
+          '### Validation completed; stable publication held' >> $env:GITHUB_STEP_SUMMARY
+          'A Windows Authenticode certificate is required. No unsigned installer will be published to the stable feed.' >> $env:GITHUB_STEP_SUMMARY
+          Write-Output '::warning::Stable desktop publication is held until Windows signing is configured.'
+  publish:
+    needs: validate
+    if: vars.WINDOWS_SIGNING_READY == 'true'
+    runs-on: windows-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CSC_LINK_B64: ${{ secrets.CSC_LINK_B64 }}
+      CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+    steps:
+      - name: Enforce signing prerequisite
+        shell: pwsh
+        run: |
+          if (-not $env:CSC_LINK_B64) { throw 'Signing was enabled without CSC_LINK_B64. Stable publication is blocked.' }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: nexussafiret/sinsdexide-website
+          ref: ${{ needs.validate.outputs.source_sha }}
+          path: source
+          ssh-key: ${{ secrets.SINSDEX_SOURCE_SSH_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: source/desktop/package-lock.json
+      - name: Install tools and restore runtime
+        working-directory: source/desktop
+        run: |
+          npm ci
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          node tools/bootstrap-runtime.cjs
+      - name: Choose next immutable release version
+        working-directory: source/desktop
+        run: node tools/next-version.cjs
+      - name: Repack changed source before signing
+        working-directory: source/desktop
+        run: |
+          python tools/repack.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python tools/verify-package.py
+      - name: Configure certificate and Windows SDK signing tool
+        shell: pwsh
+        run: |
+          $certificateFile = Join-Path $env:RUNNER_TEMP 'sinsdex-signing.pfx'
+          [IO.File]::WriteAllBytes($certificateFile, [Convert]::FromBase64String($env:CSC_LINK_B64))
+          "CSC_LINK=$certificateFile" >> $env:GITHUB_ENV
+          $sdkRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+          $signTool = Get-ChildItem -LiteralPath $sdkRoot -Filter signtool.exe -Recurse | Where-Object { $_.FullName -match '\\x64\\signtool.exe$' } | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signTool) { throw 'Windows SDK signtool is missing.' }
+          "SINSDEX_SIGNTOOL=$($signTool.FullName)" >> $env:GITHUB_ENV
+      - name: Build signed per-user NSIS installer
+        working-directory: source/desktop
+        run: npm run dist:win
+      - name: Verify final installer Authenticode publisher
+        shell: pwsh
+        working-directory: source/desktop
+        run: ./tools/verify-signature.ps1 -Installer "release/Sinsdex-IDE-Setup-$env:SINSDEX_VERSION-x64.exe" -Publisher 'Sinsdex IDE'
+      - name: Publish immutable signed release assets
+        shell: pwsh
+        working-directory: source/desktop
+        run: |
+          $installer = "release/Sinsdex-IDE-Setup-$env:SINSDEX_VERSION-x64.exe"
+          $notes = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+          "Sinsdex IDE $env:SINSDEX_VERSION`n`nWindows Authenticode publisher: Sinsdex IDE.`nSource snapshot: ${{ needs.validate.outputs.source_sha }}." | Set-Content -LiteralPath $notes
+          gh release create "v$env:SINSDEX_VERSION" $installer "$installer.blockmap" 'release/latest.yml' --repo nexussafiret/sinsdex-releases --target main --title "Sinsdex IDE $env:SINSDEX_VERSION" --notes-file $notes
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: nexussafiret/sinsdexide-website
+          ref: main
+          path: site
+          ssh-key: ${{ secrets.SINSDEX_SOURCE_SSH_KEY }}
+      - name: Verify published bytes and update website manifest
+        shell: pwsh
+        working-directory: source/desktop
+        run: |
+          $env:SINSDEX_WEBSITE_ROOT = Join-Path $env:GITHUB_WORKSPACE 'site'
+          node tools/prepare-release.cjs "release/Sinsdex-IDE-Setup-$env:SINSDEX_VERSION-x64.exe" nexussafiret/sinsdex-releases
+      - name: Commit manifest to trigger website deployment
+        shell: pwsh
+        working-directory: site
+        run: |
+          git config user.name 'Sinsdex release automation'
+          git config user.email 'tubrocafi@gmail.com'
+          git add releases/stable.json
+          git commit -m "Publish signed Sinsdex IDE $env:SINSDEX_VERSION"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            git push origin HEAD:main
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($attempt -eq 3) { throw 'Manifest push failed; the previous live feed remains unchanged.' }
+            git pull --rebase origin main
+            if ($LASTEXITCODE) { throw 'Manifest rebase requires review.' }
+          }
+          "Signed release published; website manifest updated for $env:SINSDEX_VERSION." >> $env:GITHUB_STEP_SUMMARY
