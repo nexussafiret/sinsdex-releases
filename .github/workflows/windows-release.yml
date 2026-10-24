@@ -61,6 +61,8 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           node tools/verify-project-updates.cjs
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          node tools/verify-usage-economy.cjs
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           node --check app/main.js
       - name: Repack and verify Electron integrity
         working-directory: source/desktop
