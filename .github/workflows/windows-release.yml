@@ -74,6 +74,15 @@ jobs:
           python tools/repack.py
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           python tools/verify-package.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $env:SINSDEX_TEST_TOOL_ENTRY = (Resolve-Path 'runtime/resources/app.asar.unpacked/mcp-preview.js').Path
+          node tools/verify-tool-catalog.cjs
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $env:SINSDEX_TEST_TOOL_NODE = (Resolve-Path 'runtime/Sinsdex IDE.exe').Path
+          node tools/verify-tool-catalog.cjs
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Remove-Item Env:\SINSDEX_TEST_TOOL_ENTRY
+          Remove-Item Env:\SINSDEX_TEST_TOOL_NODE
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: desktop-verification-${{ steps.source.outputs.sha }}
