@@ -53,6 +53,10 @@ jobs:
       - name: Verify settings, local account boundaries and updater controls
         working-directory: source/desktop
         run: |
+          node tools/verify-account-connections.cjs
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          node tools/verify-mcp-sync.cjs
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           node tools/verify-settings-store.cjs
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           node tools/verify-local-policy.cjs
