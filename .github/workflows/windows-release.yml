@@ -1,4 +1,4 @@
-name: Signed Windows release
+name: Verified Windows releases
 on:
   push:
     tags: ['desktop-*']
@@ -59,6 +59,8 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           node tools/verify-updates.cjs
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          node tools/verify-project-updates.cjs
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           node --check app/main.js
       - name: Repack and verify Electron integrity
         working-directory: source/desktop
@@ -75,12 +77,11 @@ jobs:
       - name: Report signing gate
         if: vars.WINDOWS_SIGNING_READY != 'true'
         run: |
-          '### Validation completed; stable publication held' >> $env:GITHUB_STEP_SUMMARY
-          'A Windows Authenticode certificate is required. No unsigned installer will be published to the stable feed.' >> $env:GITHUB_STEP_SUMMARY
-          Write-Output '::warning::Stable desktop publication is held until Windows signing is configured.'
+          '### Authenticode stable channel remains separate' >> $env:GITHUB_STEP_SUMMARY
+          'Stable publication requires a Windows certificate. The selected preview channel uses its own pinned Ed25519 release verification and does not claim Windows Authenticode.' >> $env:GITHUB_STEP_SUMMARY
   publish:
     needs: validate
-    if: vars.WINDOWS_SIGNING_READY == 'true'
+    if: vars.WINDOWS_SIGNING_READY == 'true' && vars.DEFAULT_RELEASE_CHANNEL == 'stable'
     permissions:
       contents: write
     runs-on: windows-latest
@@ -117,6 +118,7 @@ jobs:
       - name: Repack changed source before signing
         working-directory: source/desktop
         run: |
+          node tools/select-update-channel.cjs stable
           python tools/repack.py
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           python tools/verify-package.py
@@ -189,3 +191,91 @@ jobs:
         run: |
           $certificateFile = Join-Path $env:RUNNER_TEMP 'sinsdex-signing.pfx'
           if (Test-Path -LiteralPath $certificateFile) { Remove-Item -LiteralPath $certificateFile -Force }
+  preview:
+    name: Publish project-authenticated preview
+    needs: validate
+    if: vars.PREVIEW_SIGNING_READY == 'true' && vars.DEFAULT_RELEASE_CHANNEL == 'preview'
+    permissions:
+      contents: write
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: nexussafiret/sinsdexide-website
+          ref: ${{ needs.validate.outputs.source_sha }}
+          path: source
+          ssh-key: ${{ secrets.SINSDEX_SOURCE_SSH_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: source/desktop/package-lock.json
+      - name: Install tools and restore verified runtime
+        working-directory: source/desktop
+        run: |
+          npm ci
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          node tools/bootstrap-runtime.cjs
+      - name: Choose next preview version
+        working-directory: source/desktop
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node tools/next-version.cjs
+      - name: Repack preview client with pinned project verification key
+        working-directory: source/desktop
+        run: |
+          node tools/select-update-channel.cjs preview
+          python tools/repack.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python tools/verify-package.py
+      - name: Build preview bootstrap (Windows unsigned)
+        working-directory: source/desktop
+        run: npm run dist:preview
+      - name: Publish immutable preview installer
+        working-directory: source/desktop
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $installer = "release/Sinsdex-IDE-Setup-$env:SINSDEX_VERSION-x64.exe"
+          $notes = Join-Path $env:RUNNER_TEMP 'preview-release-notes.md'
+          "Sinsdex IDE $env:SINSDEX_VERSION preview`n`nWindows Authenticode: unsigned. Project updates are authenticated with the public Ed25519 key embedded in this bootstrap. Install this bootstrap once; subsequent preview updates verify the signed manifest and actual installer bytes before installation.`n`nProject proof and SHA-512 checksums are attached after publication verification." | Set-Content -LiteralPath $notes
+          gh release create "v$env:SINSDEX_VERSION-preview" $installer "$installer.blockmap" --repo nexussafiret/sinsdex-releases --target main --prerelease --title "Sinsdex IDE $env:SINSDEX_VERSION — project-authenticated preview" --notes-file $notes
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: nexussafiret/sinsdexide-website
+          ref: main
+          path: site
+          ssh-key: ${{ secrets.SINSDEX_SOURCE_SSH_KEY }}
+      - name: Recheck public artifact bytes and sign preview release statement
+        working-directory: source/desktop
+        env:
+          SINSDEX_PREVIEW_SIGNING_KEY_B64: ${{ secrets.SINSDEX_PREVIEW_SIGNING_KEY_B64 }}
+        run: |
+          $env:SINSDEX_WEBSITE_ROOT = Join-Path $env:GITHUB_WORKSPACE 'site'
+          node tools/prepare-project-preview.cjs "release/Sinsdex-IDE-Setup-$env:SINSDEX_VERSION-x64.exe"
+      - name: Attach public project proof and checksums
+        working-directory: source/desktop
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "v$env:SINSDEX_VERSION-preview" "release/Sinsdex-IDE-Setup-$env:SINSDEX_VERSION-x64.exe.proof.json" "release/Sinsdex-IDE-$env:SINSDEX_VERSION-preview-checksums.txt" --repo nexussafiret/sinsdex-releases
+      - name: Activate authenticated preview feed through native Git deployment
+        working-directory: site
+        env:
+          SINSDEX_PUBLISH_EMAIL: ${{ secrets.SINSDEX_PUBLISH_EMAIL }}
+        run: |
+          if (-not $env:SINSDEX_PUBLISH_EMAIL) { throw 'Deployment author is not configured.' }
+          git config user.name 'Sinsdex release automation'
+          git config user.email $env:SINSDEX_PUBLISH_EMAIL
+          git add releases/preview.json
+          git commit -m "Publish project-authenticated Sinsdex IDE $env:SINSDEX_VERSION preview"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            git push origin HEAD:main
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($attempt -eq 3) { throw 'Preview feed push failed; previous release stays live.' }
+            git pull --rebase origin main
+            if ($LASTEXITCODE) { throw 'Preview feed rebase requires review.' }
+          }
+          "Project-signed preview published: $env:SINSDEX_VERSION. Windows installer is unsigned; Authenticode stable feed was not changed." >> $env:GITHUB_STEP_SUMMARY
