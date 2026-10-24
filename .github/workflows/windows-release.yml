@@ -9,7 +9,7 @@ on:
         required: true
         type: string
 permissions:
-  contents: write
+  contents: read
 concurrency:
   group: signed-windows-release
   cancel-in-progress: false
@@ -81,6 +81,8 @@ jobs:
   publish:
     needs: validate
     if: vars.WINDOWS_SIGNING_READY == 'true'
+    permissions:
+      contents: write
     runs-on: windows-latest
     steps:
       - name: Enforce signing prerequisite
